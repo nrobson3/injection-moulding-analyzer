@@ -6,18 +6,32 @@ import numpy as np
 
 
 def read_stl(path):
-    """Triangles as an (n, 3, 3) float array, ASCII or binary."""
+    """Triangles as an (n, 3, 3) float array, ASCII or binary.
+
+    A binary file whose size matches its triangle count is read as binary even if
+    its 80-byte header starts with 'solid' (some exporters write that); a binary
+    file with padding after the triangles is read too. Anything else that yields
+    no triangles raises ValueError."""
     with open(path, 'rb') as f:
         data = f.read()
-    if len(data) >= 84:
-        n = struct.unpack('<I', data[80:84])[0]
-        if 84 + 50 * n == len(data) or (84 + 50 * n < len(data) and not data.lstrip()[:5].lower() == b'solid'):
-            rec = np.frombuffer(data, dtype=np.dtype([('n', '<f4', 3), ('v', '<f4', (3, 3)), ('a', '<u2')]),
-                                count=n, offset=84)
-            return rec['v'].astype(float)
-    verts = [list(map(float, line.split()[1:4])) for line in data.decode('ascii', 'replace').splitlines()
-             if line.strip().lower().startswith('vertex')]
-    return np.array(verts, float).reshape(-1, 3, 3)
+    n = struct.unpack('<I', data[80:84])[0] if len(data) >= 84 else None
+
+    def binary():
+        rec = np.frombuffer(data, dtype=np.dtype([('n', '<f4', 3), ('v', '<f4', (3, 3)), ('a', '<u2')]),
+                            count=n, offset=84)
+        return rec['v'].astype(float)
+
+    if n is not None and 84 + 50 * n == len(data):
+        return binary()
+    verts = []
+    if data.lstrip()[:5].lower() == b'solid':
+        verts = [list(map(float, line.split()[1:4])) for line in data.decode('ascii', 'replace').splitlines()
+                 if line.strip().lower().startswith('vertex')]
+    if verts and len(verts) % 3 == 0:
+        return np.array(verts, float).reshape(-1, 3, 3)
+    if n and 84 + 50 * n <= len(data):
+        return binary()
+    raise ValueError('%s: no triangles read (not a valid ASCII or binary STL)' % path)
 
 
 def write_stl(path, tris):
@@ -34,6 +48,10 @@ class Mesh:
 
     def __init__(self, tris, decimals=6):
         tris = np.asarray(tris, float)
+        if tris.ndim != 3 or tris.shape[1:] != (3, 3) or len(tris) == 0:
+            raise ValueError('expected a non-empty (n, 3, 3) array of triangles')
+        if not np.all(np.isfinite(tris)):
+            raise ValueError('the mesh has NaN or infinite coordinates')
         keys = np.round(tris.reshape(-1, 3), decimals)
         self.vertices, inv = np.unique(keys, axis=0, return_inverse=True)
         self.faces = inv.reshape(-1, 3)
@@ -41,6 +59,10 @@ class Mesh:
         cross = np.cross(b - a, c - a)
         twice = np.linalg.norm(cross, axis=1)
         keep = twice > 1e-12                      # drop zero-area triangles
+        _, first = np.unique(np.sort(self.faces, axis=1), axis=0, return_index=True)
+        unique = np.zeros(len(self.faces), bool)
+        unique[first] = True
+        keep &= unique                            # and exact duplicates (a file with a face written twice)
         self.faces, cross, twice = self.faces[keep], cross[keep], twice[keep]
         a, b, c = (self.vertices[self.faces[:, i]] for i in range(3))
         self.volume = float(np.einsum('ij,ij->i', a, np.cross(b, c)).sum() / 6.0)
@@ -64,7 +86,8 @@ class Mesh:
 
     @property
     def bounds(self):
-        return self.vertices.min(0), self.vertices.max(0)
+        used = self.vertices[np.unique(self.faces)]          # not the vertices of dropped faces
+        return used.min(0), used.max(0)
 
     def edges(self):
         """{(v0, v1) sorted: [face, ...]} for every edge."""
