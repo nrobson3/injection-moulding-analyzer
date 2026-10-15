@@ -54,8 +54,9 @@ def text_summary(r, name='part'):
            d['area']['low'], 100 * d['area']['low'] / total, len(d['low_regions'])),
         'undercuts: %.1f mm2 needing side action; %.1f mm2 negligible (under %.2f mm deep)'
         % (u['area'], u['negligible_area'], u['min_depth']),
-        'wall: nominal %.2f mm (min %.2f, max %.2f); thick (>1.5x) %.1f mm2, thin (<0.5x) %.1f mm2'
-        % (t['nominal'], t['min'], t['max'], t['thick_area'], t['thin_area']),
+        ('wall: nominal %.2f mm (min %.2f, max %.2f); thick (>1.5x) %.1f mm2, thin (<0.5x) %.1f mm2'
+         % (t['nominal'], t['min'], t['max'], t['thick_area'], t['thin_area'])) if t['nominal'] is not None
+        else 'wall: not measured (no inward ray met a far wall; is the mesh closed?)',
         'parting line candidates: %d loop(s), longest %.1f mm; zero-draft area %.1f mm2'
         % (p['loops'], p['longest'], p['zero_draft_area']),
     ]
@@ -117,12 +118,12 @@ def figures(mesh, r, out, name):
     draft_cols = np.array([DRAFT_COLOURS[c] for c in f['class']])
     draft_cols[f['undercut'] == 1] = UNDERCUT
     draft_cols[f['undercut'] == 2] = NEGLIGIBLE
-    t = np.where(np.isfinite(f['thickness']), f['thickness'], r['thickness']['nominal'])
+    nominal = r['thickness']['nominal'] or 1.0
+    t = np.where(np.isfinite(f['thickness']), f['thickness'], nominal)
     # display only: average each face with its neighbours, so long sliver triangles in
     # a CAD export do not paint streaks across the map (the numbers stay per face)
     nb = mesh.neighbours()
     t = np.array([np.average(t[[i] + nb[i]], weights=mesh.areas[[i] + nb[i]]) for i in range(len(t))])
-    nominal = r['thickness']['nominal']
     tn = np.clip(t / nominal, 0, 2) / 2                                    # 0..2x nominal -> 0..1
     cmap = plt.get_cmap('coolwarm')
     thick_cols = cmap(tn)[:, :3]
@@ -142,11 +143,13 @@ def figures(mesh, r, out, name):
                                Patch(color=NEGLIGIBLE, label='negligible undercut')],
                loc='upper center', bbox_to_anchor=(0.45, 0.535), ncol=6, fontsize=8, frameon=False)
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 2 * nominal))
-    fig.colorbar(sm, ax=axes[1, :], shrink=0.6, label='wall thickness, mm (nominal %.2f)' % nominal)
-    fig.suptitle('%s: undercuts %.1f mm2, smallest wall draft %s deg, nominal wall %.2f mm'
+    nom_txt = '%.2f' % r['thickness']['nominal'] if r['thickness']['nominal'] is not None else 'not measured'
+    fig.colorbar(sm, ax=axes[1, :], shrink=0.6, label='wall thickness, mm (nominal %s)' % nom_txt)
+    fig.suptitle('%s: undercuts %.1f mm2, smallest wall draft %s deg, nominal wall %s mm'
                  % (name, r['undercuts']['area'],
-                    '%.2f' % r['draft']['smallest_wall_draft'] if r['draft']['smallest_wall_draft'] else '-',
-                    nominal), fontsize=11)
+                    '%.2f' % r['draft']['smallest_wall_draft'] if r['draft']['smallest_wall_draft'] is not None
+                    else '-',
+                    nom_txt), fontsize=11)
     path = os.path.join(out, name + '.png')
     fig.savefig(path, dpi=120)
     plt.close(fig)

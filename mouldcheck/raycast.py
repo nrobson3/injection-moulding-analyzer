@@ -16,18 +16,23 @@ class RayCaster:
         self.e2 = t[:, 2] - t[:, 0]
         self.lo = t.min(1)
         self.hi = t.max(1)
+        self.box = (t.reshape(-1, 3).min(0), t.reshape(-1, 3).max(0))
 
     def first_hit(self, origins, dirs, max_dist=np.inf, chunk=48, skip=None):
         """Distance to the first triangle hit along each ray (inf for none).
         'skip' is an optional face index per ray to ignore (the face it starts on)."""
-        origins = np.asarray(origins, float)
-        dirs = np.asarray(dirs, float)
-        dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
+        origins = np.asarray(origins, float).reshape(-1, 3)
+        dirs = np.asarray(dirs, float).reshape(-1, 3)
         out = np.full(len(origins), np.inf)
+        if len(origins) == 0:
+            return out
+        dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
         for s in range(0, len(origins), chunk):
             o, d = origins[s:s + chunk], dirs[s:s + chunk]
             # prefilter: triangles whose box meets the boxes of these ray segments
-            reach = np.where(np.isfinite(max_dist), max_dist, 1e6)
+            # an unlimited ray only needs to reach the far corner of the mesh's box
+            far = np.maximum(np.abs(o - self.box[0]), np.abs(o - self.box[1]))
+            reach = min(max_dist, float(np.linalg.norm(far, axis=1).max()) + 1.0)
             ends = o + d * reach
             seg_lo = np.minimum(o, ends).min(0)
             seg_hi = np.maximum(o, ends).max(0)

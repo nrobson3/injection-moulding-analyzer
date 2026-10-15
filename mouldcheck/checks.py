@@ -12,6 +12,7 @@ Units are the mesh's own; every length default below (depths, sample spacing)
 assumes millimetres, which is what CAD STL exports normally use.
 """
 import math
+import numbers
 
 import numpy as np
 
@@ -19,9 +20,18 @@ from .mesh import components
 from .raycast import RayCaster
 
 
+# a face within 0.5 deg of square to the pull has no usable sideways direction:
+# below this, mesh rounding (a 1e-6 mm weld grid tilts flat faces by ~1e-6 rad)
+# would hand it an arbitrary one
+FLAT_SIDE = math.sin(math.radians(0.5))
+
+
 def unit(v):
     v = np.asarray(v, float)
-    return v / np.linalg.norm(v)
+    n = float(np.linalg.norm(v))
+    if not math.isfinite(n) or n < 1e-12:
+        raise ValueError('a direction must be a non-zero vector, got %r' % (v.tolist(),))
+    return v / n
 
 
 # ------------------------------------------------------------------ draft
@@ -137,7 +147,7 @@ def backdraft_travel(mesh, caster, faces, d):
     n = mesh.normals[faces]
     along = np.abs(n @ d)
     perp = np.linalg.norm(n - np.outer(n @ d, d), axis=1)
-    if np.any(perp < 1e-6):
+    if np.any(perp < FLAT_SIDE):
         return None
     h = mesh.tris[faces].reshape(-1, 3) @ d
     travel = float((h.max() - h.min()) * np.max(along / perp))
@@ -161,27 +171,42 @@ def side_travel(mesh, caster, faces, d, max_depth=20.0, first_step=0.01, iters=1
     sample needs the smallest shift along its face's sideways normal that frees
     it: found by doubling steps from first_step, then bisection, so an obstacle
     further along the shift does not fool it. The region needs the largest of
-    those. A face square to the pull has no sideways normal and borrows that of
-    the nearest sloped face in the region; a region with no sloped face at all
-    tries eight directions square to the pull."""
-    n = mesh.normals[faces]
-    side = n - np.outer(n @ d, d)
-    length = np.linalg.norm(side, axis=1)
-    sloped = length > 1e-6
-    if sloped.any():
-        side = side / np.where(sloped, length, 1.0)[:, None]
-        if not sloped.all():
-            cen = mesh.centroids[faces]
-            src = np.flatnonzero(sloped)
-            for i in np.flatnonzero(~sloped):
-                side[i] = side[src[np.argmin(np.linalg.norm(cen[src] - cen[i], axis=1))]]
-        candidates = [side]
-    else:
+    those.
+
+    A face square to the pull has no sideways normal of its own. It borrows the
+    one of the nearest face that has one and faces it across open space (each in
+    front of the other, so never a face on the far side of the material): from the
+    region itself if it can, otherwise from the rest of the part. For a groove roof
+    that is the groove's back wall, for the underside of a lip the wall below it.
+    Where some face finds none, or the region has no sloped face, eight fixed
+    directions square to the pull are tried as well."""
+    side_all = mesh.normals - np.outer(mesh.normals @ d, d)
+    len_all = np.linalg.norm(side_all, axis=1)
+    sloped_all = len_all >= FLAT_SIDE
+    side = np.zeros((len(faces), 3))
+    own = sloped_all[faces]
+    side[own] = side_all[faces[own]] / len_all[faces[own], None]
+    got = own.copy()
+    pools = (faces[own], np.flatnonzero(sloped_all))
+    for i in np.flatnonzero(~own):
+        f = faces[i]
+        for pool in pools:
+            if len(pool) == 0:
+                continue
+            v = mesh.centroids[pool] - mesh.centroids[f]
+            facing = (v @ mesh.normals[f] > 0) & ((v * mesh.normals[pool]).sum(1) < 0)
+            if facing.any():
+                j = pool[facing][np.argmin((v[facing] ** 2).sum(1))]
+                side[i] = side_all[j] / len_all[j]
+                got[i] = True
+                break
+    candidates = [side] if got.all() else []
+    if not own.any() or not got.all():
         a = np.cross(d, [1.0, 0, 0] if abs(d[0]) < 0.9 else [0, 1.0, 0])
         a /= np.linalg.norm(a)
         b = np.cross(d, a)
-        candidates = [np.tile(math.cos(k * math.pi / 4) * a + math.sin(k * math.pi / 4) * b, (len(faces), 1))
-                      for k in range(8)]
+        candidates += [np.tile(math.cos(k * math.pi / 4) * a + math.sin(k * math.pi / 4) * b, (len(faces), 1))
+                       for k in range(8)]
     all_pts, all_k = _samples(mesh, faces)
     steps = []
     s = first_step
@@ -223,37 +248,52 @@ def side_travel(mesh, caster, faces, d, max_depth=20.0, first_step=0.01, iters=1
 
 # ------------------------------------------------------------------ wall thickness
 def thickness(mesh, caster=None, thick=1.5, thin=0.5, max_dist=None):
-    """Local wall thickness at each face from two measures:
-      ray   distance along the inward normal to the far side of the wall. Right
-            almost everywhere, but from the edge face of a thin plate (or the end
-            of a slot) it runs along the plate and reads its width.
-      ball  diameter of the largest ball inside the material touching the face
-            (shrinking-ball medial-axis estimate over surface samples). Right on
-            those edge faces, but tangent at a point near a convex edge it is
-            genuinely small, so on its own it reads thin along every edge.
-    The ray is used unless it reads thick (over thick x a first-pass nominal);
-    then the ball decides. A face is only called thick when both agree, which
-    keeps real thick sections (boss and rib roots) and drops rays that were
-    just running along a wall.
-    The nominal wall is the area-weighted median. Faces over thick x nominal are
-    flagged as sink / void risk (bosses, rib roots), under thin x nominal as hard
-    to fill.
+    """Local wall thickness at each face.
 
-    The ball is an upper bound: it is limited by the surface samples it can see,
-    and a missing sample can only let it grow. Samples every 0.5 mm keep the
-    error well under that on the walls of a moulded part."""
+    ray   the distance along the inward normal to the far side of the wall. Right
+          almost everywhere. From an edge face (the rim of a plate, the side of a
+          slot, the small faces of an edge round) it runs along the wall instead
+          and reads long.
+    For those faces, where the ray reads over thick x a first-pass nominal:
+    wall  the ray reading of the nearest face whose ray is not long: the wall the
+          edge belongs to.
+    ball  the diameter of the largest ball inside the material touching the face
+          at its centroid, found against the triangles themselves. It never
+          exceeds the true thickness, so it can only raise the wall value: where
+          it is larger, the section really is thicker (a boss or rib root, a
+          thick floor). A ball alone would read thin along every edge, since a
+          ball touching a face near a convex edge is pinched by that edge.
+    So an edge face reads max(wall, ball), never more than its own ray.
+    The nominal wall is the area-weighted median. Faces over thick x nominal are
+    flagged as sink / void risk, under thin x nominal as hard to fill. Faces with
+    no reading (an open mesh) are left out; if none has one, the summary's
+    nominal is None."""
     caster = caster or RayCaster(mesh.tris)
     lo, hi = mesh.bounds
     max_dist = max_dist or float(np.linalg.norm(hi - lo))
-    ray = caster.first_hit(mesh.centroids - 1e-4 * mesh.normals, -mesh.normals, max_dist=max_dist,
-                           skip=np.arange(len(mesh.faces)))
+    nudge = 1e-4
+    ray = caster.first_hit(mesh.centroids - nudge * mesh.normals, -mesh.normals, max_dist=max_dist,
+                           skip=np.arange(len(mesh.faces))) + nudge     # measured from the surface itself
     ok = np.isfinite(ray)
-    first = weighted_median(ray[ok], mesh.areas[ok])
-    long = ~ok | (ray > thick * first)
     t = ray.copy()
-    if long.any():
-        t[long] = inscribed_ball(mesh, faces=np.flatnonzero(long))
+    if ok.any():
+        first = weighted_median(ray[ok], mesh.areas[ok])
+        long = ~ok | (ray > thick * first)
+        L, S = np.flatnonzero(long), np.flatnonzero(~long)
+        if len(L):
+            wall = np.full(len(L), np.nan)
+            if len(S):
+                cs = mesh.centroids[S]
+                for k in range(0, len(L), 256):
+                    d2 = ((mesh.centroids[L[k:k + 256], None, :] - cs[None, :, :]) ** 2).sum(-1)
+                    wall[k:k + 256] = ray[S][np.argmin(d2, axis=1)]
+            ball = inscribed_ball(mesh, L, at_least=wall, start=first / 8)
+            t[L] = np.minimum(ball, np.where(ok[L], ray[L], np.inf))
     ok = np.isfinite(t)
+    empty = {'nominal': None, 'max': None, 'min': None, 'thick_area': 0.0, 'thin_area': 0.0,
+             'thick_regions': []}
+    if not ok.any():
+        return t, empty
     nominal = weighted_median(t[ok], mesh.areas[ok])
     thick_mask = ok & (t > thick * nominal)
     thin_mask = ok & (t < thin * nominal)
@@ -275,48 +315,82 @@ def weighted_median(values, weights):
     return float(values[order][np.searchsorted(cum, cum[-1] / 2)])
 
 
-def surface_samples(mesh, spacing=0.5, cap=150000):
-    """Points spread over the surface about 'spacing' apart: along every edge (long
-    thin triangles are mostly edge) and on a barycentric grid inside each face."""
-    pts = [mesh.vertices]
-    e = np.array(list(mesh.edges().keys()))
-    a, b = mesh.vertices[e[:, 0]], mesh.vertices[e[:, 1]]
-    n = np.ceil(np.linalg.norm(b - a, axis=1) / spacing).astype(int)
-    for k in np.unique(n[n > 1]):
-        sel = n == k
-        t = (np.arange(1, k) / k)[None, :, None]
-        pts.append((a[sel][:, None, :] + t * (b[sel] - a[sel])[:, None, :]).reshape(-1, 3))
-    for tri, area in zip(mesh.tris, mesh.areas):
-        k = int(min(30, math.ceil(math.sqrt(area) / spacing)))
-        if k <= 1:
-            continue
-        i, j = np.meshgrid(np.arange(k + 1), np.arange(k + 1))
-        keep = i + j <= k
-        a, b = i[keep] / k, j[keep] / k
-        pts.append(tri[0] + np.outer(a, tri[1] - tri[0]) + np.outer(b, tri[2] - tri[0]))
-    pts = np.vstack(pts)
-    if len(pts) > cap:
-        pts = pts[np.random.default_rng(0).choice(len(pts), cap, replace=False)]
-    return pts
+def point_triangle_distance(p, a, b, c):
+    """Distance from point p to each triangle (a, b, c), vectorised over triangles
+    (closest-point regions after Ericson, Real-Time Collision Detection 5.1.5)."""
+    ab, ac = b - a, c - a
+    ap, bp, cp = p - a, p - b, p - c
+    d1, d2 = (ab * ap).sum(1), (ac * ap).sum(1)
+    d3, d4 = (ab * bp).sum(1), (ac * bp).sum(1)
+    d5, d6 = (ab * cp).sum(1), (ac * cp).sum(1)
+    va, vb, vc = d3 * d6 - d5 * d4, d5 * d2 - d1 * d6, d1 * d4 - d3 * d2
+    with np.errstate(divide='ignore', invalid='ignore'):
+        regions = [(d1 <= 0) & (d2 <= 0),
+                   (d3 >= 0) & (d4 <= d3),
+                   (vc <= 0) & (d1 >= 0) & (d3 <= 0),
+                   (d6 >= 0) & (d5 <= d6),
+                   (vb <= 0) & (d2 >= 0) & (d6 <= 0),
+                   (va <= 0) & (d4 - d3 >= 0) & (d5 - d6 >= 0)]
+        q = np.select(
+            [r[:, None] for r in regions],
+            [a, b,
+             a + ab * (d1 / (d1 - d3))[:, None],
+             c,
+             a + ac * (d2 / (d2 - d6))[:, None],
+             b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)))[:, None]],
+            a + ab * (vb / (va + vb + vc))[:, None] + ac * (vc / (va + vb + vc))[:, None])
+    return np.linalg.norm(p - q, axis=1)
 
 
-def inscribed_ball(mesh, faces=None, chunk=32, spacing=0.5):
+def inscribed_ball(mesh, faces=None, at_least=None, start=0.1, iters=12):
     """Diameter of the largest ball inside the material that touches each face at
-    its centroid. A ball tangent at p (inward normal m) that passes through a
-    surface point q has radius |q - p|^2 / (2 (q - p).m); the inscribed ball is the
-    smallest such radius over the surface samples on the inward side."""
+    its centroid, or at_least (per face) if the ball is smaller than that; inf
+    where no ball is ever stopped (an open mesh).
+
+    The ball's centre moves inward along the normal. It is first tried at
+    at_least: if that ball already reaches another triangle the answer is
+    at_least, at the cost of one distance test. Otherwise it grows by doubling
+    (from 'start' where at_least is not given) until it reaches another
+    triangle, then bisects to about 1e-4 of its size."""
     faces = np.arange(len(mesh.faces)) if faces is None else np.asarray(faces)
-    samples = surface_samples(mesh, spacing)
+    floor = np.full(len(faces), np.nan) if at_least is None else np.asarray(at_least, float)
+    lo_t, hi_t = mesh.tris.min(1), mesh.tris.max(1)
+    r_max = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])) / 2
+    a, b, c = mesh.tris[:, 0], mesh.tris[:, 1], mesh.tris[:, 2]
     out = np.full(len(faces), np.inf)
-    for s0 in range(0, len(faces), chunk):
-        f = faces[s0:s0 + chunk]
-        p = mesh.centroids[f]
-        m = -mesh.normals[f]
-        dvec = samples[None, :, :] - p[:, None, :]
-        dm = np.einsum('kni,ki->kn', dvec, m)
-        d2 = np.einsum('kni,kni->kn', dvec, dvec)
-        r = np.where(dm > 1e-6 * np.sqrt(d2) + 1e-9, d2 / (2 * np.where(dm > 0, dm, 1)), np.inf)
-        out[s0:s0 + chunk] = 2 * r.min(1)
+    for i, f in enumerate(faces):
+        p, m = mesh.centroids[f], -mesh.normals[f]
+
+        def near(r):
+            ctr = p + r * m
+            sel = np.flatnonzero(np.all(hi_t >= ctr - r, 1) & np.all(lo_t <= ctr + r, 1))
+            return sel[sel != f]
+
+        def blocked(r, sel):
+            return len(sel) > 0 and bool(np.any(
+                point_triangle_distance(p + r * m, a[sel], b[sel], c[sel]) < r * (1 - 1e-9)))
+
+        if np.isfinite(floor[i]):
+            r = min(floor[i] / 2, r_max)
+            if blocked(r, near(r)):
+                out[i] = floor[i]
+                continue
+            r_lo, r = r, min(2 * r, r_max)
+        else:
+            r_lo, r = 0.0, min(max(start, 1e-6), r_max)
+        while not blocked(r, near(r)):
+            if r >= r_max:
+                break
+            r_lo, r = r, min(2 * r, r_max)
+        else:
+            sel = near(r)
+            for _ in range(iters):
+                mid = (r_lo + r) / 2
+                if blocked(mid, sel):
+                    r = mid
+                else:
+                    r_lo = mid
+            out[i] = r_lo + r
     return out
 
 
@@ -338,14 +412,14 @@ def parting_lines(mesh, pull, vertical_tol=0.25):
     for (u, v), fs in mesh.edges().items():
         if len(fs) == 2 and side[fs[0]] * side[fs[1]] == -1:
             edges.append((u, v))
-    loops = chain_edges(edges)
     out = []
-    for loop in loops:
-        p = mesh.vertices[loop]
+    for path, closed in chain_edges(edges):
+        p = mesh.vertices[path]
         h = p @ d
-        seg = np.linalg.norm(np.diff(np.vstack([p, p[:1]]), axis=0), axis=1)
+        q = np.vstack([p, p[:1]]) if closed else p
+        seg = np.linalg.norm(np.diff(q, axis=0), axis=1)
         out.append({'length': float(seg.sum()), 'height': (float(h.min()), float(h.max())),
-                    'planar': bool(h.max() - h.min() < 1e-3), 'points': p})
+                    'planar': bool(h.max() - h.min() < 1e-3), 'closed': closed, 'points': p})
     out.sort(key=lambda x: -x['length'])
     ambiguous = float(mesh.areas[side == 0].sum())
     return out, {'loops': len(out), 'longest': out[0]['length'] if out else 0.0,
@@ -353,28 +427,39 @@ def parting_lines(mesh, pull, vertical_tol=0.25):
 
 
 def chain_edges(edges):
-    """Join undirected vertex-index edges into vertex loops (open chains kept too)."""
+    """Join undirected vertex-index edges into paths: [(vertices, closed), ...].
+    A path that does not close is grown from both ends, so it comes back whole."""
     adj = {}
     for u, v in edges:
         adj.setdefault(u, []).append(v)
         adj.setdefault(v, []).append(u)
     seen = set()
-    loops = []
-    for u, v in edges:
-        if (u, v) in seen or (v, u) in seen:
-            continue
-        seen.add((u, v))
-        loop = [u, v]
+
+    def key(a, b):
+        return (a, b) if a < b else (b, a)
+
+    def grow(path):
         while True:
-            nxt = [w for w in adj[loop[-1]] if (loop[-1], w) not in seen and (w, loop[-1]) not in seen]
+            nxt = [w for w in adj[path[-1]] if key(path[-1], w) not in seen]
             if not nxt:
-                break
-            seen.add((loop[-1], nxt[0]))
-            if nxt[0] == loop[0]:
-                break
-            loop.append(nxt[0])
-        loops.append(loop)
-    return loops
+                return False
+            seen.add(key(path[-1], nxt[0]))
+            if nxt[0] == path[0]:
+                return True
+            path.append(nxt[0])
+
+    out = []
+    for u, v in edges:
+        if key(u, v) in seen:
+            continue
+        seen.add(key(u, v))
+        path = [u, v]
+        closed = grow(path)
+        if not closed:
+            path.reverse()
+            grow(path)
+        out.append((path, closed))
+    return out
 
 
 # ------------------------------------------------------------------ snap fits
@@ -386,11 +471,18 @@ def cantilever_snap(L, t, b, y, E, yield_strain, lead_deg=30.0, mu=0.5, repeated
     Allowable strain follows the common resin-supplier rule: 70 % of yield strain
     for one assembly, 60 % of that if it is assembled repeatedly.
     """
+    for name, val in (('L', L), ('t', t), ('b', b), ('y', y), ('E', E), ('yield_strain', yield_strain)):
+        if not (isinstance(val, numbers.Real) and math.isfinite(val) and val > 0):
+            raise ValueError('%s must be a positive number, got %r' % (name, val))
+    if not 0 <= lead_deg < 90:
+        raise ValueError('lead_deg must be from 0 up to (not including) 90 degrees, got %r' % lead_deg)
+    if not mu >= 0:
+        raise ValueError('mu must be zero or positive, got %r' % mu)
     strain = 1.5 * t * y / L ** 2
     allow = 0.7 * yield_strain * (0.6 if repeated else 1.0)
     P = b * t ** 2 / 6.0 * E * strain / L                     # tip force to deflect, N
     ta = math.tan(math.radians(lead_deg))
-    if mu * ta >= 1:
+    if mu * ta >= 1 - 1e-9:
         raise ValueError('lead-in angle self-locks at this friction: assembly force is unbounded')
     W = P * (mu + ta) / (1 - mu * ta)                          # axial push-on force, N
     return {'strain': strain, 'allowable': allow, 'safety': allow / strain, 'deflection_force': P,

@@ -45,7 +45,7 @@ matching the design.
 | Negligible undercuts | none | 2 × 2.35 mm², **0.005 mm** deep |
 | Nominal wall | 2.00 mm | 2.00 mm |
 | Thickest point | 3.00 mm | 2.65 mm |
-| Thin areas (< 1.0 mm) | 81 % ribs and deflection stops (0.45–0.54× wall by design); the rest edge breaks | 73 % snap arms and boss walls (thinner than the wall by design); the rest the 0.4 mm front edge round |
+| Thin areas (< 1.0 mm) | 730 mm²: 99 % the three ribs and four deflection stops (0.45–0.49× the wall, by design); the rest small faces by the snap-catch windows | 16 mm², all on the snap arms by their barbs (the arms are 1.2 mm, 0.6× the wall, by design) |
 
 The cover's two "negligible" regions are real and worth knowing about. Below each
 snap barb there is a 0.2 mm strip of arm that continues the arm's 1.5° draft.
@@ -82,7 +82,9 @@ Each region then gets a **depth**, from the cheaper of two fixes:
   The search doubles the step from 0.01 mm, then bisects, so an obstacle further
   along the shift does not fool it. Both halves are tried, and the region needs
   its worst sample. A face square to the pull (a groove roof) has no sideways
-  normal of its own, so it borrows the nearest sloped face's.
+  normal of its own. It borrows the one of the nearest face that faces it across
+  open space, such as the groove's back wall, never a face on the far side of
+  the material.
 - **Back-draft.** Form the region from the other half instead. The overlap is
   then the region's height along the pull × tan(draft), provided that half's
   path is clear. It needs no moving steel, so it is chosen unless a side action
@@ -93,22 +95,24 @@ Regions shallower than 0.02 mm are reported as negligible and painted
 separately. Without a depth, a yes/no undercut check flags tolerance-level
 overlaps like the one on the cover as if they needed a slide.
 
-**Wall thickness.** There are two measures, because each one fails somewhere:
-- **Ray.** The distance along the inward normal to the far side. It is exact
-  against a flat opposite wall, but from the edge face of a plate it runs along
-  the plate and reads the plate's width.
-- **Inscribed ball.** The diameter of the largest ball inside the material
-  touching the face. It is the shrinking-ball medial-axis estimate:
-  r = |q − p|² / (2 (q − p)·m), minimised over surface samples every 0.5 mm.
-  It gets plate edges right, but near a convex edge it is genuinely small.
+**Wall thickness.** The main measure is a **ray**: the distance along the
+inward normal to the far side of the wall. It is exact against an opposite
+wall. From an edge face (the rim of a plate, the side of a slot, the small faces
+of an edge round) it runs along the wall instead and reads long. Where it reads
+over 1.5× the first-pass nominal, two more measures decide:
+- **Wall.** The ray reading of the nearest face whose ray is not long, i.e.
+  the wall the edge belongs to.
+- **Ball.** The diameter of the largest ball inside the material that touches
+  the face, found by bisection against the triangles themselves (exact
+  point-to-triangle distances). A ball never exceeds the true thickness, so
+  where it is bigger than the wall reading the section really is thick: a boss
+  or rib root, a thick floor.
 
-The ray is used unless it reads thick; then the ball decides. A face is only
-called thick when both agree. Real thick sections (boss and rib roots) stay
-flagged, and rays that just ran along a wall drop out.
-
-The ball is an upper bound. It only sees the surface samples, and a missing
-sample can only let it grow; at a 0.5 mm spacing the error is small next to a
-moulded wall.
+An edge face reads the larger of the two, never more than its own ray. The ball
+on its own is no good at edges. A ball touching a face near a convex edge is
+pinched by that edge: 0.008 mm on the small faces of the cover's edge round.
+The first version used a ball sampled every 0.5 mm, and that flagged the cover's
+snap arms and boss walls as thin when they are 1.2 mm.
 
 **Parting line.** These are the mesh edges where the release direction flips
 from +pull to −pull, chained into loops. Each loop is reported as planar (a flat
@@ -144,10 +148,10 @@ groove, any floor thickness.
 
 ![Undercut on a grooved cup](docs/grooved_cup.png)
 
-*A cup with a 1.0 mm internal groove. The groove's roof, floor and back wall
-are found as one undercut region, 1.000 mm deep. The steel at the top of the
+*A cup with a 1.2 mm internal groove. The groove's roof, floor and back wall
+are found as one undercut region, 1.200 mm deep. The steel at the top of the
 back wall has to move the full groove depth to pass the lip above it; the
-walls' draft only helps lower down. The 1.0 mm wall behind the groove is
+walls' draft only helps lower down. The 0.8 mm wall behind the groove is
 flagged thin.*
 
 ```
@@ -158,21 +162,25 @@ The tests check:
 - draft read back to 0.01° at four angles;
 - the release side of every wall;
 - groove undercut depths of 0.5, 1 and 1.5 mm, to 0.005 mm;
-- zero undercuts on a plain cup;
+- the same depth with the part and pull rotated together;
+- a tall groove, an external ring groove and an inward lip;
+- zero undercuts on a plain cup, and a 0.01 mm groove called negligible;
 - the same answer with the pull reversed;
 - no depth when nothing clears the undercut within reach;
 - a face wound against its neighbours is caught;
-- nominal wall, a thick floor and a thin groove wall;
+- nominal wall, a thick floor, a thin groove wall, and thin plates whose
+  edges must not read thick;
+- an open mesh reported rather than crashing;
 - the parting-line loop's length and height;
-- the snap-fit numbers against a hand calculation.
+- the snap-fit numbers against a hand calculation, and bad inputs refused.
 
 ## Requirements and limits
 
 - Python 3.9 or newer, with numpy and matplotlib.
 - Ray tests are vectorised brute force. A full run, figure included, takes about
-  4 s for the 2,000-triangle test cup, 5 s for the 4,500-triangle cover and
-  11 s for the 6,100-triangle body on a laptop. Time grows roughly with the
-  square of the triangle count, so export the STL at a moderate refinement.
+  3 s for the 2,000-triangle test cup or the 4,500-triangle cover, and 5 s for
+  the 6,100-triangle body, on a laptop. Time grows faster than the triangle
+  count, so export the STL at a moderate refinement.
 - Undercut detection fires one ray per face. A large face that is only partly
   overhung can be missed, so faces should be small next to the features that
   could trap them.
@@ -180,9 +188,12 @@ The tests check:
   isn't.
 - One straight pull per run. To check a side action, run again with its
   direction.
-- Small convex edge breaks (chamfers, edge rounds under about 1 mm) read thin: the
-  inward ray from a face at 45° cuts across the corner. They show up as narrow
-  strips along edges in the thickness map.
+- Faceting reads curved walls slightly thin and tapers slightly under their
+  draft, by a factor of cos(π/N) for N facets per circle. On a coarse mesh, a
+  wall at exactly half the nominal can be flagged thin, and a draft at exactly
+  the minimum can be flagged low. Export at 64 or more facets per circle.
+- An edge face takes the reading of the nearest wall. Where a thin wall meets a
+  thick one, the edge faces at the junction can take either.
 - Flow and weld-line prediction need a fill simulation and are out of scope.
 
 ## License
