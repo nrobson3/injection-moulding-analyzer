@@ -1,4 +1,4 @@
-# injection-moulding-dfm
+# injection-moulding-analyzer
 
 `mouldcheck` runs a mould maker's first checks on a part. It reads an STL plus the
 direction the mould opens, and answers the questions a toolmaker asks before quoting:
